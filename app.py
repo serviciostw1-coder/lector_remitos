@@ -37,19 +37,24 @@ PROMPT = """Leé este remito y devolvé SOLO un JSON con estas claves:
 numero (ej: "00020 - 00002467"), fecha (dd/mm/aaaa), cliente (código y nombre tal como figura, ej: "C305634 - Apellido Nombre"),
 domicilio, localidad (tal como figura, con el código postal entre paréntesis), cuit, telefono, celular, condicion,
 items (lista de objetos con cantidad, codigo, descripcion).
+Si el archivo tiene varios remitos, devolvé una lista con un objeto por remito.
 Copiá el texto exactamente como está impreso. Si un dato no figura, poné "-". No inventes nada."""
 
-def leer(data):
-    img = ImageOps.exif_transpose(Image.open(io.BytesIO(data))).convert("RGB")
-    img.thumbnail((1800, 1800))
-    buf = io.BytesIO()
-    img.save(buf, "JPEG", quality=85)
+def leer(data, es_pdf=False):
+    if es_pdf:
+        contenido, mime = data, "application/pdf"
+    else:
+        img = ImageOps.exif_transpose(Image.open(io.BytesIO(data))).convert("RGB")
+        img.thumbnail((1800, 1800))
+        buf = io.BytesIO()
+        img.save(buf, "JPEG", quality=85)
+        contenido, mime = buf.getvalue(), "image/jpeg"
     ultimo = None
     for modelo in MODELOS:
         try:
             r = client.models.generate_content(
                 model=modelo,
-                contents=[types.Part.from_bytes(data=buf.getvalue(), mime_type="image/jpeg"), PROMPT],
+                contents=[types.Part.from_bytes(data=contenido, mime_type=mime), PROMPT],
                 config=types.GenerateContentConfig(response_mime_type="application/json", temperature=0),
             )
             break
@@ -58,15 +63,18 @@ def leer(data):
     else:
         raise ultimo
     d = json.loads(r.text)
-    if isinstance(d, list):
-        d = d[0]
-    detalle = "\n".join(
-        f"{i.get('cantidad', '1')} x [{i.get('codigo', '')}] {i.get('descripcion', '')}"
-        for i in d.get("items", [])
-    )
+    if isinstance(d, dict):
+        d = [d]
     claves = ["numero", "fecha", "cliente", "domicilio", "localidad",
               "cuit", "telefono", "celular", "condicion"]
-    return [str(d.get(k) or "-") for k in claves] + [detalle or "-"]
+    filas = []
+    for x in d:
+        detalle = "\n".join(
+            f"{i.get('cantidad', '1')} x [{i.get('codigo', '')}] {i.get('descripcion', '')}"
+            for i in x.get("items", [])
+        )
+        filas.append([str(x.get(k) or "-") for k in claves] + [detalle or "-"])
+    return filas
 
 def crear_excel(df):
     df = df.fillna("")
@@ -116,7 +124,7 @@ with tab1:
     if c:
         fotos.append(c)
 with tab2:
-    fotos += st.file_uploader("Elegí una o varias imágenes", type=["jpg", "jpeg", "png"],
+    fotos += st.file_uploader("Elegí una o varias imágenes o PDF", type=["jpg", "jpeg", "png", "pdf"],
                               accept_multiple_files=True)
 
 if fotos and st.button("🚀 Procesar", type="primary"):
@@ -127,7 +135,9 @@ if fotos and st.button("🚀 Procesar", type="primary"):
             continue
         with st.spinner("Leyendo remito..."):
             try:
-                st.session_state.df.loc[len(st.session_state.df)] = leer(data)
+                es_pdf = getattr(f, "name", "").lower().endswith(".pdf")
+                for fila in leer(data, es_pdf):
+                    st.session_state.df.loc[len(st.session_state.df)] = fila
                 st.session_state.hechos.add(h)
             except Exception as e:
                 st.error(f"No se pudo leer {getattr(f, 'name', 'la foto')}: {e}")
