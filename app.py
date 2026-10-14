@@ -32,36 +32,41 @@ CENTRADAS = {0, 1, 5, 6, 7}
 CON_AJUSTE = {8, 9}
 
 MODELOS = ["gemini-3.6-flash", "gemini-3.7-flash", "gemini-3.5-flash"]
+MAX_ARCHIVOS = 10          # archivos por consulta
+MAX_MB = 15                # tamaño total por consulta
 
-PROMPT = """Leé este remito y devolvé SOLO un JSON con estas claves:
+PROMPT = """Recibís uno o varios archivos (fotos o PDF) de remitos. Cada archivo puede tener uno o varios remitos.
+Devolvé SOLO un JSON: una lista con un objeto por remito, en el mismo orden de los archivos. Cada objeto tiene estas claves:
 numero (ej: "00020 - 00002467"), fecha (dd/mm/aaaa), cliente (código y nombre tal como figura, ej: "C305634 - Apellido Nombre"),
 domicilio, localidad (tal como figura, con el código postal entre paréntesis), cuit, telefono, celular, condicion,
 items (lista de objetos con cantidad, codigo, descripcion).
-Si el archivo tiene varios remitos, devolvé una lista con un objeto por remito.
 Copiá el texto exactamente como está impreso. Si un dato no figura, poné "-". No inventes nada."""
 
-def leer(data, es_pdf=False):
-    if es_pdf:
-        contenido, mime = data, "application/pdf"
-    else:
-        img = ImageOps.exif_transpose(Image.open(io.BytesIO(data))).convert("RGB")
-        img.thumbnail((1800, 1800))
-        buf = io.BytesIO()
-        img.save(buf, "JPEG", quality=85)
-        contenido, mime = buf.getvalue(), "image/jpeg"
-    ultimo = None
+def preparar(f):
+    data = f.getvalue()
+    if getattr(f, "name", "").lower().endswith(".pdf"):
+        return types.Part.from_bytes(data=data, mime_type="application/pdf"), len(data)
+    img = ImageOps.exif_transpose(Image.open(io.BytesIO(data))).convert("RGB")
+    img.thumbnail((1800, 1800))
+    buf = io.BytesIO()
+    img.save(buf, "JPEG", quality=85)
+    jpg = buf.getvalue()
+    return types.Part.from_bytes(data=jpg, mime_type="image/jpeg"), len(jpg)
+
+def leer(partes):
+    errores = []
     for modelo in MODELOS:
         try:
             r = client.models.generate_content(
                 model=modelo,
-                contents=[types.Part.from_bytes(data=contenido, mime_type=mime), PROMPT],
+                contents=partes + [PROMPT],
                 config=types.GenerateContentConfig(response_mime_type="application/json", temperature=0),
             )
             break
         except Exception as e:
-            ultimo = e
+            errores.append(f"{modelo}: {str(e)[:160]}")
     else:
-        raise ultimo
+        raise RuntimeError(" | ".join(errores))
     d = json.loads(r.text)
     if isinstance(d, dict):
         d = [d]
@@ -74,7 +79,7 @@ def leer(data, es_pdf=False):
             for i in x.get("items", [])
         )
         filas.append([str(x.get(k) or "-") for k in claves] + [detalle or "-"])
-    return filas
+    return filas, modelo
 
 def crear_excel(df):
     df = df.fillna("")
@@ -128,19 +133,35 @@ with tab2:
                               accept_multiple_files=True)
 
 if fotos and st.button("🚀 Procesar", type="primary"):
+    lotes, actual, peso = [], [], 0
     for f in fotos:
-        data = f.getvalue()
-        h = hashlib.md5(data).hexdigest()
+        h = hashlib.md5(f.getvalue()).hexdigest()
         if h in st.session_state.hechos:
             continue
-        with st.spinner("Leyendo remito..."):
+        try:
+            parte, n = preparar(f)
+        except Exception as e:
+            st.error(f"No se pudo abrir {getattr(f, 'name', 'la foto')}: {e}")
+            continue
+        if actual and (len(actual) >= MAX_ARCHIVOS or peso + n > MAX_MB * 1024 * 1024):
+            lotes.append(actual)
+            actual, peso = [], 0
+        actual.append((h, parte))
+        peso += n
+    if actual:
+        lotes.append(actual)
+    for lote in lotes:
+        with st.spinner(f"Leyendo {len(lote)} archivo(s) en una sola consulta..."):
             try:
-                es_pdf = getattr(f, "name", "").lower().endswith(".pdf")
-                for fila in leer(data, es_pdf):
+                filas, modelo = leer([p for _, p in lote])
+                for fila in filas:
                     st.session_state.df.loc[len(st.session_state.df)] = fila
-                st.session_state.hechos.add(h)
+                st.session_state.hechos.update(h for h, _ in lote)
+                st.caption(f"Leído con {modelo}: {len(lote)} archivo(s), {len(filas)} remito(s).")
+                if len(filas) != len(lote):
+                    st.warning("La cantidad de remitos no coincide con la de archivos. Revisá la tabla.")
             except Exception as e:
-                st.error(f"No se pudo leer {getattr(f, 'name', 'la foto')}: {e}")
+                st.error(f"No se pudo leer: {e}")
 
 if not st.session_state.df.empty:
     st.caption("Revisá los datos: podés corregir cualquier celda antes de descargar.")
